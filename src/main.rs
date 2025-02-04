@@ -29,7 +29,7 @@ const DEFAULT_DT: f32 = 0.016;
 const DEFAULT_MAX_SPEED: f32 = 50_000.0;
 const DEFAULT_NUM_BINS: usize = 500;
 const DEFAULT_MEAN_SPEED: f32 = 10_000.0;
-const DEFAULT_ROLLING_FRAMES: usize = 500;
+const DEFAULT_ROLLING_FRAMES: u64 = 500;
 
 // ===================================================================================
 // Simulation Parameters
@@ -46,7 +46,7 @@ struct SimulationParams {
     max_speed: f32,
     num_bins: usize,
     mean_speed: f32,
-    rolling_frames: usize,
+    rolling_frames: u64,
 }
 
 impl Default for SimulationParams {
@@ -120,8 +120,8 @@ struct MyApp {
     particles: ParticleStorage,
     speed_hist: Vec<f32>,                   // raw histogram for current frame
     hist_ring: Vec<Vec<f32>>,               // ring buffer of histograms
-    hist_index: usize,                      // next slot in ring buffer
-    stored_frames: usize,                   // how many frames stored so far
+    hist_index: u64,                      // next slot in ring buffer
+    stored_frames: u64,                   // how many frames stored so far
     smooth_speed_hist: Vec<f32>,            // rolling average of histograms
 
     // -------------- Derived Data --------------
@@ -183,7 +183,7 @@ impl MyApp {
 
         // Reinitialise histogram buffers
         self.speed_hist = vec![0.0; self.actual_num_bins];
-        self.hist_ring = vec![vec![0.0; self.actual_num_bins]; self.params.rolling_frames];
+        self.hist_ring = vec![vec![0.0; self.actual_num_bins]; self.params.rolling_frames as usize];
         self.hist_index = 0;
         self.stored_frames = 0;
         self.smooth_speed_hist = vec![0.0; self.actual_num_bins];
@@ -216,19 +216,25 @@ impl MyApp {
         // Copy current histogram
         let mut frame_hist = vec![0.0; self.actual_num_bins];
         frame_hist.copy_from_slice(&self.speed_hist);
-
-        // Write into ring buffer
-        self.hist_ring[self.hist_index] = frame_hist;
-        self.hist_index = (self.hist_index + 1) % self.params.rolling_frames;
-
-        if self.stored_frames < self.params.rolling_frames {
+    
+        // Make sure hist_index is wrapped
+        let ring_size = self.hist_ring.len() as u64;
+        let idx = self.hist_index % ring_size; // ensure it's in [0..ring_size-1]
+    
+        self.hist_ring[idx as usize] = frame_hist;
+    
+        // Increment and wrap for next time
+        self.hist_index += 1;
+        self.hist_index %= ring_size;
+    
+        if self.stored_frames < ring_size {
             self.stored_frames += 1;
         }
 
         // Smooth
         self.smooth_speed_hist.fill(0.0);
         for frame_idx in 0..self.stored_frames {
-            let arr = &self.hist_ring[frame_idx];
+            let arr = &self.hist_ring[frame_idx as usize];
             for (bin_idx, &val) in arr.iter().enumerate() {
                 self.smooth_speed_hist[bin_idx] += val;
             }
@@ -372,15 +378,15 @@ impl eframe::App for MyApp {
 
             // Sliders: only matter if we haven't started or we want to reset
             if !self.running {
-                ui.add(egui::Slider::new(&mut self.params.num_particles, 1000..=50_000).text("Particles"));
+                ui.add(egui::Slider::new(&mut self.params.num_particles, 1..=50_000).text("Particles"));
                 ui.add(egui::Slider::new(&mut self.params.radius, 0.5..=10.0).text("Particle Radius"));
-                ui.add(egui::Slider::new(&mut self.params.box_size_x, 1000.0..=10_000.0).text("Box Size X"));
-                ui.add(egui::Slider::new(&mut self.params.box_size_y, 500.0..=5_000.0).text("Box Size Y"));
-                ui.add(egui::Slider::new(&mut self.params.dt, 0.0001..=0.1).text("DT"));
-                ui.add(egui::Slider::new(&mut self.params.max_speed, 1000.0..=100_000.0).text("Max Speed"));
-                ui.add(egui::Slider::new(&mut self.params.num_bins, 100..=1000).text("Num Bins"));
+                ui.add(egui::Slider::new(&mut self.params.box_size_x, 1.0..=10_000.0).text("Box Size X"));
+                ui.add(egui::Slider::new(&mut self.params.box_size_y, 1.0..=10_000.0).text("Box Size Y"));
+                ui.add(egui::Slider::new(&mut self.params.dt, 0.0001..=1.0).text("DT"));
+                ui.add(egui::Slider::new(&mut self.params.max_speed, 1.0..=100_000.0).text("Max Speed"));
+                ui.add(egui::Slider::new(&mut self.params.num_bins, 1..=1000).text("Num Bins"));
                 ui.add(egui::Slider::new(&mut self.params.mean_speed, 0.0..=50_000.0).text("Mean Speed"));
-                ui.add(egui::Slider::new(&mut self.params.rolling_frames, 10..=1000).text("Rolling Frames"));
+                ui.add(egui::Slider::new(&mut self.params.rolling_frames, 1..=100_000).text("Rolling Frames"));
             } else {
                 ui.label("Parameters locked while running. Stop to change.");
             }
@@ -445,8 +451,8 @@ impl eframe::App for MyApp {
             .show(ctx, |ui| {
                 ui.label("Speed distribution (rolling average)");
                 let plot = Plot::new("speed_histogram")
-                    .width(200.0)
-                    .height(400.0)
+                    //.width(200.0)
+                    //.height(400.0)
                     .allow_scroll(true)
                     .allow_drag(true);
 
