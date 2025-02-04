@@ -1,0 +1,19 @@
+[package]
+name = "particle_sim"
+version = "0.1.0"
+edition = "2024"
+
+# Make sure to use the nightly toolchain, e.g. `rustup override set nightly`.
+# Then you can pass RUSTFLAGS such as: 
+#   RUSTFLAGS="-C target-cpu=native" cargo run
+# to enable use of advanced CPU features.
+
+[dependencies]
+eframe = "^0.30.0"
+egui_plot = { version = "0.30.0"}
+rand = "0.9.0"
+rayon = "1.10.0"
+num_cpus = "1.16.0"
+
+[profile.release]
+opt-level = 3
