@@ -165,7 +165,10 @@ impl MyApp {
             self.particles.y[i] = y;
 
             // random speed
-            let speed: f32 = rng.random_range(0..(self.params.mean_speed as i64 * 2)) as f32;
+            let speed: f32 = self.params.mean_speed as f32;
+            //rng.random_range(0..(self.params.mean_speed as i64 * 2)) as f32;
+            //sample_maxwell_boltzmann_speed(&mut rng, self.params.mean_speed);
+
             let angle: f32 = rng.random_range(0.0..(2.0 * PI));
             self.particles.vx[i] = speed * angle.cos();
             self.particles.vy[i] = speed * angle.sin();
