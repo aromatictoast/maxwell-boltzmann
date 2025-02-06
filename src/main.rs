@@ -24,6 +24,8 @@ const DEFAULT_MEAN_SPEED: f32 = 10_000.0;
 const DEFAULT_ROLLING_FRAMES: u64 = 500;
 const DEFAULT_STARTING_DISTRIBUTION: StartingDistribution = StartingDistribution::ConstantDist;
 
+const COLLISION_BOX_COEFFICIENT: f32 = 0.5; // the size (in diameters) of the boxes used to parallelise the collision checking
+
 // ===================================================================================
 // Simulation Parameters
 // ===================================================================================
@@ -97,7 +99,7 @@ impl ParticleStorage {
 // ==================================================================================================
 
 /// Stores the selected distibution to initialise particles with in an enum
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum StartingDistribution {
     MaxwellBoltzmann,
     ConstantDist,
@@ -109,6 +111,19 @@ trait Distribution {
     fn sample(&self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32);
     fn new() -> Self;
 }
+
+// string converter to allow us to display the options neatly in the dropdown box
+impl StartingDistribution {
+    fn as_str(&self) -> &'static str {
+        match self {
+            StartingDistribution::MaxwellBoltzmann => "Maxwell-Boltzmann",
+            StartingDistribution::ConstantDist => "Constant",
+            StartingDistribution::LinearRandom => "Linear Random",
+            StartingDistribution::Normal => "Normal",
+        }
+    }
+}
+
 /// Delegate StartingDistribution sampling to the appropriate distribution object
 // the idea is that the StartingDistribution enum acts as a sort of pass-through alias for the true selected distribution
 // therefore any calls to the sample function need to be delegated as appropriate
@@ -135,10 +150,10 @@ impl Distribution for StandardNormal {
         Self {}
     }
 
-    fn sample(&self, rng: &mut impl Rng, _mean_speed: f32) -> (f32, f32) {
+    fn sample(&self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32) {
         let u1: f32 = rng.random();
         let u2: f32 = rng.random();
-        let r: f32 = (-2.0_f32 * u1.ln()).sqrt();
+        let r: f32 = (-2.0_f32 * u1.ln()).sqrt() * mean_speed;
         let theta: f32 = 2.0_f32 * PI * u2;
         (r * theta.cos(), r * theta.sin())
     }  
@@ -188,7 +203,7 @@ impl Distribution for MaxwellBoltzmann {
     }
 
     fn sample(&self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32) {
-        let sigma: f32 = mean_speed * PI.sqrt() / 2.0;
+        let sigma: f32 = PI.sqrt() / 2.0; // the mean_speed multiplication already happens in the normal distribution sampler
         let normal_gen: StandardNormal = StandardNormal::new(); 
         let (vx, vy) = normal_gen.sample(rng, mean_speed);
         let velocities: (f32, f32) = (sigma * vx, sigma * vy);
@@ -347,72 +362,191 @@ impl App {
         }
     }
 
-    /// Runs an O(n^2) collision detection/resolution on **single thread** for simplicity
-    /// If I try to make this parallel I may cry
+    /// Runs collision detection and resolution using broad-phase spatial partitioning - essentially just divide up the box in to mini boxes
+    /// Then, only need to check for collision inside the box
+    /// Collision events are collected in parallel and resolved in a single-threaded pass to avoid data races
+    /// Improved from old O(n^2) system
     fn handle_collisions(&mut self) {
+        use rayon::prelude::*;
+
         let diameter: f32 = self.params.radius * 2.0;
         let n: usize = self.actual_num_particles;
 
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let dx = self.particles.x[j] - self.particles.x[i];
-                let dy = self.particles.y[j] - self.particles.y[i];
-                let dist2 = dx * dx + dy * dy;
-                if dist2 < diameter * diameter {
-                    let dist = dist2.sqrt();
-                    if dist == 0.0 {
-                        continue; // perfect overlap => skip
-                    }
+        // local struct to store collision info
+        #[derive(Clone)]
+        struct Collision {
+            i: usize,   // index of first particle
+            j: usize,   // index of second particle
+            // velocity deltas
+            dvx_i: f32,
+            dvy_i: f32,
+            dvx_j: f32,
+            dvy_j: f32,
+            // position corrections
+            dx_i: f32,
+            dy_i: f32,
+            dx_j: f32,
+            dy_j: f32,
+        }
 
-                    let nx = dx / dist;
-                    let ny = dy / dist;
+        // grid cell - should be at least the diameter but can be changed
+        let cell_size: f32 = diameter * COLLISION_BOX_COEFFICIENT;
+        // number of cells in x and y directions
+        let nx: isize = (self.params.box_size_x / cell_size).ceil() as isize;
+        let ny: isize = (self.params.box_size_y / cell_size).ceil() as isize;
 
-                    let v1n = self.particles.vx[i] * nx + self.particles.vy[i] * ny;
-                    let v2n = self.particles.vx[j] * nx + self.particles.vy[j] * ny;
+        // build a vector of buckets, each bucket will store particle indices
+        // we make it of length nx * ny (convert to usize safely)
+        if nx <= 0 || ny <= 0 {
+            // if the box dimensions are too small can just skip broad phase
+            // fallback to single thread loop or do nothing
+            return;
+        }
+        let mut grid: Vec<Vec<usize>> = vec![Vec::new(); (nx * ny) as usize];
 
-                    // swap normal components
-                    let v1n_post = v2n; 
-                    let v2n_post = v1n;
-
-                    self.particles.vx[i] += (v1n_post - v1n) * nx;
-                    self.particles.vy[i] += (v1n_post - v1n) * ny;
-                    self.particles.vx[j] += (v2n_post - v2n) * nx;
-                    self.particles.vy[j] += (v2n_post - v2n) * ny;
-
-                    // push them apart
-                    let overlap = diameter - dist;
-                    let half_overlap = 0.5 * overlap;
-                    self.particles.x[i] -= nx * half_overlap;
-                    self.particles.y[i] -= ny * half_overlap;
-                    self.particles.x[j] += nx * half_overlap;
-                    self.particles.y[j] += ny * half_overlap;
-                }
+        // function to map a particle at (px, py) -> grid index
+        // returns None if out of bounds
+        let grid_index = |px: f32, py: f32| -> Option<usize> {
+            let gx: isize = (px / cell_size).floor() as isize;
+            let gy: isize = (py / cell_size).floor() as isize;
+            if gx < 0 || gy < 0 || gx >= nx || gy >= ny {
+                return None;
             }
+            let idx = gy * nx + gx;
+            Some(idx as usize)
+        };
+
+        // assign particles to grid buckets (single-threaded for simplicity)
+        for i in 0..n {
+            let px = self.particles.x[i];
+            let py = self.particles.y[i];
+            if let Some(idx) = grid_index(px, py) {
+                grid[idx].push(i);
+            }
+        }
+
+        // detection in parallel: for each cell, check collisions in that cell + some number of neighbours
+        // collect all collisions in local buffers, then flatten
+        let collisions: Vec<Collision> = (0..grid.len())
+            .into_par_iter()
+            .flat_map(|cell_id: usize| {
+                let mut local_collisions: Vec<Collision> = Vec::new();
+
+                let cell_x: isize = cell_id as isize % nx;
+                let cell_y: isize = cell_id as isize / nx;
+
+                // we look in [cell_x-1, cell_x, cell_x+1] and [cell_y-1, cell_y, cell_y+1]
+                for cx_off in (cell_x - 1).max(0)..=(cell_x + 1).min(nx - 1) {
+                    for cy_off in (cell_y - 1).max(0)..=(cell_y + 1).min(ny - 1) {
+                        let neighbour_id: usize = (cy_off * nx + cx_off) as usize;
+
+                        // to avoid checking pairs twice, skip if neighbour < cell
+                        if neighbour_id < cell_id {
+                            continue;
+                        }
+
+                        let particles_a: &Vec<usize> = &grid[cell_id];
+                        let particles_b: &Vec<usize> = &grid[neighbour_id];
+
+                        for (index_a, &i) in particles_a.iter().enumerate() {
+                            // if same cell, only check j > i in that cell
+                            let start_b: usize = if neighbour_id == cell_id {
+                                index_a + 1
+                            } else {
+                                0
+                            };
+                            for &j in &particles_b[start_b..] {
+
+                                let dx: f32 = self.particles.x[j] - self.particles.x[i];
+                                let dy: f32 = self.particles.y[j] - self.particles.y[i];
+                                let dist2 = dx * dx + dy * dy;
+                                if dist2 < diameter * diameter {
+                                    let dist = dist2.sqrt();
+                                    if dist == 0.0 {
+                                        // perfect overlap => skip - something very bad has happened - bosons anyone?
+                                        continue;
+                                    }
+
+                                    let nx: f32 = dx / dist;
+                                    let ny: f32 = dy / dist;
+
+                                    let v1n: f32 = self.particles.vx[i] * nx + self.particles.vy[i] * ny;
+                                    let v2n: f32 = self.particles.vx[j] * nx + self.particles.vy[j] * ny;
+
+                                    // swap normal components
+                                    let v1n_post: f32 = v2n;
+                                    let v2n_post: f32 = v1n;
+
+                                    let dvx_i: f32 = (v1n_post - v1n) * nx;
+                                    let dvy_i: f32 = (v1n_post - v1n) * ny;
+                                    let dvx_j: f32 = (v2n_post - v2n) * nx;
+                                    let dvy_j: f32 = (v2n_post - v2n) * ny;
+
+                                    // push them apart
+                                    let overlap: f32 = diameter - dist;
+                                    let half_overlap: f32 = 0.5 * overlap;
+                                    let dx_i: f32 = -nx * half_overlap;
+                                    let dy_i: f32 = -ny * half_overlap;
+                                    let dx_j: f32 = nx * half_overlap;
+                                    let dy_j: f32 = ny * half_overlap;
+
+                                    local_collisions.push(Collision {
+                                        i,
+                                        j,
+                                        dvx_i,
+                                        dvy_i,
+                                        dvx_j,
+                                        dvy_j,
+                                        dx_i,
+                                        dy_i,
+                                        dx_j,
+                                        dy_j,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                local_collisions
+            })
+            .collect();
+
+        // single-threaded resolution 
+        for c in collisions {
+            self.particles.vx[c.i] += c.dvx_i;
+            self.particles.vy[c.i] += c.dvy_i;
+            self.particles.vx[c.j] += c.dvx_j;
+            self.particles.vy[c.j] += c.dvy_j;
+
+            self.particles.x[c.i] += c.dx_i;
+            self.particles.y[c.i] += c.dy_i;
+            self.particles.x[c.j] += c.dx_j;
+            self.particles.y[c.j] += c.dy_j;
         }
     }
 
-    /// Parallel + SIMD approach for updating positions.
+    /// Parallel + SIMD approach for updating positions
     fn update_positions_parallel(&mut self) {
-        // We'll do the position update in parallel across chunks of 8.
-        let n = self.actual_num_particles;
-        let dt = self.params.dt;
+        // position update in parallel chunks of 8.
+        let n: usize = self.actual_num_particles;
+        let dt: f32 = self.params.dt;
 
-        // Number of chunks of 8 we can handle
-        let chunked_len = n / 8;
+        // number of chunks
+        let chunked_len: usize = n / 8;
 
-        // Each chunk is processed in parallel
+        // update the chunks in parallel
         let new_positions: Vec<(f32x8, f32x8)> = (0..chunked_len)
             .into_par_iter()
             .map(|chunk_index| {
-                let chunk_start = chunk_index * 8;
-                let vx_simd = f32x8::from_slice(&self.particles.vx[chunk_start..]);
-                let vy_simd = f32x8::from_slice(&self.particles.vy[chunk_start..]);
-                let x_simd = f32x8::from_slice(&self.particles.x[chunk_start..]);
-                let y_simd = f32x8::from_slice(&self.particles.y[chunk_start..]);
+                let chunk_start: usize = chunk_index * 8;
+                let vx_simd: std::simd::Simd<f32, 8> = f32x8::from_slice(&self.particles.vx[chunk_start..]);
+                let vy_simd: std::simd::Simd<f32, 8> = f32x8::from_slice(&self.particles.vy[chunk_start..]);
+                let x_simd: std::simd::Simd<f32, 8> = f32x8::from_slice(&self.particles.x[chunk_start..]);
+                let y_simd: std::simd::Simd<f32, 8> = f32x8::from_slice(&self.particles.y[chunk_start..]);
 
-                let dt_simd = f32x8::splat(dt);
-                let x_new = x_simd + vx_simd * dt_simd;
-                let y_new = y_simd + vy_simd * dt_simd;
+                let dt_simd: std::simd::Simd<f32, 8> = f32x8::splat(dt);
+                let x_new: std::simd::Simd<f32, 8> = x_simd + vx_simd * dt_simd;
+                let y_new: std::simd::Simd<f32, 8> = y_simd + vy_simd * dt_simd;
 
                 (x_new, y_new)
             })
@@ -420,8 +554,8 @@ impl App {
 
         for (chunk_index, (x_new, y_new)) in new_positions.into_iter().enumerate() {
             let chunk_start = chunk_index * 8;
-            let x_slice = &mut self.particles.x[chunk_start..chunk_start + 8];
-            let y_slice = &mut self.particles.y[chunk_start..chunk_start + 8];
+            let x_slice: &mut [f32] = &mut self.particles.x[chunk_start..chunk_start + 8];
+            let y_slice: &mut [f32] = &mut self.particles.y[chunk_start..chunk_start + 8];
             x_new.as_array().iter().enumerate().for_each(|(i, &val)| {
                 x_slice[i] = val;
             });
@@ -430,14 +564,16 @@ impl App {
             });
         }
 
-        // leftover
-        let leftover_start = chunked_len * 8;
+        // leftover - there's always someone....
+        // really I should just make the slider go up in units of 8
+        // but UI design is hard....
+        let leftover_start: usize = chunked_len * 8;
         for i in leftover_start..n {
             self.particles.x[i] += self.particles.vx[i] * dt;
             self.particles.y[i] += self.particles.vy[i] * dt;
         }
 
-        
+        // unfortunately we still need to check if we have hit any walls - I suspect this might be slowing things down quite a lot
         self.particles
             .x
             .par_iter_mut()
@@ -476,7 +612,7 @@ impl eframe::App for App {
         egui::SidePanel::left("config_panel").show(ctx, |ui| {
             ui.heading("Simulation Controls");
 
-            // Sliders: only matter if we haven't started or we want to reset
+            // sliders: only matter if we haven't started or we want to reset
             if !self.running {
                 ui.add(egui::Slider::new(&mut self.params.num_particles, 1..=50_000).text("Particles"));
                 ui.add(egui::Slider::new(&mut self.params.radius, 0.5..=10.0).text("Particle Radius"));
@@ -487,6 +623,15 @@ impl eframe::App for App {
                 ui.add(egui::Slider::new(&mut self.params.num_bins, 1..=1000).text("Num Bins"));
                 ui.add(egui::Slider::new(&mut self.params.mean_speed, 0.0..=50_000.0).text("Mean Speed"));
                 ui.add(egui::Slider::new(&mut self.params.rolling_frames, 1..=100_000).text("Rolling Frames"));
+                egui::ComboBox::from_label("Starting Distribution") // why do dropdowns need so much configuring argg
+                .selected_text(self.params.distribution.as_str())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.params.distribution, StartingDistribution::MaxwellBoltzmann, "Maxwell-Boltzmann");
+                    ui.selectable_value(&mut self.params.distribution, StartingDistribution::ConstantDist, "Constant");
+                    ui.selectable_value(&mut self.params.distribution, StartingDistribution::LinearRandom, "Linear Random");
+                    ui.selectable_value(&mut self.params.distribution, StartingDistribution::Normal, "Normal");
+                });
+            
             } else {
                 ui.label("Parameters locked while running. Stop to change.");
             }
