@@ -39,6 +39,7 @@ struct SimulationParams {
     num_bins: usize,
     mean_speed: f32,
     rolling_frames: u64,
+    distribution: StartingDistribution
 }
 
 impl Default for SimulationParams {
@@ -53,6 +54,7 @@ impl Default for SimulationParams {
             num_bins: DEFAULT_NUM_BINS,
             mean_speed: DEFAULT_MEAN_SPEED,
             rolling_frames: DEFAULT_ROLLING_FRAMES,
+            distribution: DEFAULT_STARTING_DISTRIBUTION
         }
     }
 }
@@ -94,7 +96,8 @@ impl ParticleStorage {
 // The distribution of the speeds the particles are given when the simulation is initialised
 // ==================================================================================================
 
-/// Stores the option selected in an enum
+/// Stores the selected distibution to initialise particles with in an enum
+#[derive(Clone)]
 enum StartingDistribution {
     MaxwellBoltzmann,
     ConstantDist,
@@ -103,58 +106,92 @@ enum StartingDistribution {
 }
 
 trait Distribution {
-    fn sample(self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32);
+    fn sample(&self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32);
     fn new() -> Self;
 }
+/// Delegate StartingDistribution sampling to the appropriate distribution object
+// the idea is that the StartingDistribution enum acts as a sort of pass-through alias for the true selected distribution
+// therefore any calls to the sample function need to be delegated as appropriate
+impl Distribution for StartingDistribution {
+    fn sample(&self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32) {
+        match self {
+            StartingDistribution::MaxwellBoltzmann => MaxwellBoltzmann::new().sample(rng, mean_speed),
+            StartingDistribution::ConstantDist => ConstantDist::new().sample(rng, mean_speed),
+            StartingDistribution::LinearRandom => LinearRandom::new().sample(rng, mean_speed),
+            StartingDistribution::Normal => StandardNormal::new().sample(rng, mean_speed),
+        }
+    }
 
-
-struct StandardNormal {
-
+    fn new() -> Self {
+        StartingDistribution::ConstantDist
+    }
 }
 
+
+struct StandardNormal {}
 impl Distribution for StandardNormal {
     
     fn new() -> Self {
         Self {}
     }
 
-    fn sample(self, rng: &mut impl Rng, _mean_speed: f32) -> (f32, f32) {
+    fn sample(&self, rng: &mut impl Rng, _mean_speed: f32) -> (f32, f32) {
         let u1: f32 = rng.random();
         let u2: f32 = rng.random();
-        let r = (-2.0_f32 * u1.ln()).sqrt();
-        let theta = 2.0_f32 * PI * u2;
+        let r: f32 = (-2.0_f32 * u1.ln()).sqrt();
+        let theta: f32 = 2.0_f32 * PI * u2;
         (r * theta.cos(), r * theta.sin())
     }  
 }
 
-struct ConstantDist {
+struct ConstantDist {}
+impl Distribution for ConstantDist {
+    
+    fn new() -> Self {
+        Self {}
+    }
 
+    fn sample(&self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32) {
+        // The key here is to ensure a random angle - if we just returned mean_speed.sqrt(), all particles would be moving in the same direction
+        // This is equivalent to the question of
+        // 'Choose any two random numbers x and y such that sqrt(x^2 + y^2) = mean_speed
+        // In theory this should include the possibility of unbounded positive and negative values for x and y
+        // however this is obviously not an ideal situation here
+        // instead, we choose a random angle and calculate the components accordingly
+
+        let theta: f32 = rng.random_range(0.0..(2.0 * PI));
+
+        (mean_speed * theta.cos(), mean_speed * theta.sin())
+    }
 }
 
-struct LinearRandom {
+struct LinearRandom {}
+impl Distribution for LinearRandom {
+    
+    fn new() -> Self {
+        Self {}
+    }
 
+    fn sample(&self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32) {
+        let vx: f32 = rng.random_range(0..mean_speed as i64 * 2) as f32;
+        let vy: f32 = rng.random_range(0..mean_speed as i64 * 2) as f32;
+
+        (vx, vy)
+    }
 }
 
-
-
-
-
-
-struct MaxwellBoltzmann {
-
-}
-
+struct MaxwellBoltzmann {}
 impl Distribution for MaxwellBoltzmann {
     
     fn new() -> Self {
         Self {}
     }
 
-    fn sample(self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32) {
-        let sigma = mean_speed * PI.sqrt() / 2.0;
+    fn sample(&self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32) {
+        let sigma: f32 = mean_speed * PI.sqrt() / 2.0;
         let normal_gen: StandardNormal = StandardNormal::new(); 
         let (vx, vy) = normal_gen.sample(rng, mean_speed);
-        let velocities = (sigma * vx, sigma * vy);
+        let velocities: (f32, f32) = (sigma * vx, sigma * vy);
 
         velocities
     }
@@ -189,20 +226,20 @@ struct App {
     smooth_speed_hist: Vec<f32>,            // rolling average of histograms
 
     // -------------- Derived Data --------------
-    // The actual number of particles, bin count, etc. from the last init
+    // the actual number of particles, bin count, etc. from the last init
     actual_num_particles: usize,
     actual_num_bins: usize,
 }
 
+
+
 impl App {
     /// Creates the initial `App` with default config (not yet running).
     fn new() -> Self {
-        // Initially, ParticleStorage does not exist because the user
-        // can adjust sliders, then press "Start" or "Reset" to actually init.
         Self {
             params: SimulationParams::default(),
             running: false,
-            needs_reset: true, // so it initialises once
+            needs_reset: true, // so it initialises uhhhh.... initially?
 
             particles: ParticleStorage::with_capacity(DEFAULT_NUM_PARTICLES),
             speed_hist: vec![],
@@ -223,32 +260,28 @@ impl App {
         let mut rng = rand::rng();
         for i in 0..self.params.num_particles {
             // random position
-            let x = rng.random_range(self.params.radius..(self.params.box_size_x - self.params.radius));
-            let y = rng.random_range(self.params.radius..(self.params.box_size_y - self.params.radius));
+            let x: f32 = rng.random_range(self.params.radius..(self.params.box_size_x - self.params.radius));
+            let y: f32 = rng.random_range(self.params.radius..(self.params.box_size_y - self.params.radius));
             self.particles.x[i] = x;
             self.particles.y[i] = y;
 
-            // random speed
-            let speed: f32 = self.params.mean_speed as f32;
-            //rng.random_range(0..(self.params.mean_speed as i64 * 2)) as f32;
-            //sample_maxwell_boltzmann_speed(&mut rng, self.params.mean_speed);
-
-            //let angle: f32 = rng.random_range(0.0..(2.0 * PI));
-            self.particles.vx[i] //= speed * angle.cos();
-            self.particles.vy[i] //= speed * angle.sin();
+            // sets the velocity of a new particle according to the distribution selected
+            let (vx, vy) = self.params.distribution.sample(&mut rng, self.params.mean_speed);
+            self.particles.vx[i] = vx;
+            self.particles.vy[i] = vy;
 
             // random colour
-            let r = rng.random_range(0..=255) as u8;
-            let g = rng.random_range(0..=255) as u8;
-            let b = rng.random_range(0..=255) as u8;
+            let r: u8 = rng.random_range(0..=255) as u8;
+            let g: u8 = rng.random_range(0..=255) as u8;
+            let b: u8 = rng.random_range(0..=255) as u8;
             self.particles.colours[i] = Color32::from_rgb(r, g, b);
         }
 
-        // Update derived data
+        // update derived data
         self.actual_num_particles = self.params.num_particles;
         self.actual_num_bins = self.params.num_bins;
 
-        // Reinitialise histogram buffers
+        // reinitialise histogram buffers
         self.speed_hist = vec![0.0; self.actual_num_bins];
         self.hist_ring = vec![vec![0.0; self.actual_num_bins]; self.params.rolling_frames as usize];
         self.hist_index = 0;
@@ -258,39 +291,39 @@ impl App {
         self.needs_reset = false;
     }
 
-    /// Compute the speed histogram for the *current* frame.
+    /// compute the speed histogram for the *current* frame
     fn compute_speed_hist(&mut self) {
         // zero out
         for val in &mut self.speed_hist {
             *val = 0.0;
         }
 
-        let bin_count = self.actual_num_bins as f32;
-        let bin_size = self.params.max_speed / bin_count;
+        let bin_count: f32 = self.actual_num_bins as f32;
+        let bin_size: f32 = self.params.max_speed / bin_count;
 
-        // Tally speeds
+        // gather speed data
         for i in 0..self.actual_num_particles {
-            let speed = self.particles.vx[i].hypot(self.particles.vy[i]).min(self.params.max_speed);
-            let bin = (speed / bin_size) as usize;
-            let bin = bin.min(self.actual_num_bins - 1);
+            let speed: f32 = self.particles.vx[i].hypot(self.particles.vy[i]).min(self.params.max_speed);
+            let bin: usize = (speed / bin_size) as usize;
+            let bin: usize = bin.min(self.actual_num_bins - 1);
             self.speed_hist[bin] += 1.0;
         }
     }
 
     /// Push the current frame's histogram into the ring buffer, then
-    /// average them to produce a smoothed histogram.
+    /// average them to produce a smoothed histogram
     fn push_and_smooth(&mut self) {
-        // Copy current histogram
-        let mut frame_hist = vec![0.0; self.actual_num_bins];
+        // copy current histogram
+        let mut frame_hist: Vec<f32> = vec![0.0; self.actual_num_bins];
         frame_hist.copy_from_slice(&self.speed_hist);
     
-        // Make sure hist_index is wrapped
-        let ring_size = self.hist_ring.len() as u64;
-        let idx = self.hist_index % ring_size; // ensure it's in [0..ring_size-1]
+        // make sure hist_index is wrapped
+        let ring_size: u64 = self.hist_ring.len() as u64;
+        let idx: u64 = self.hist_index % ring_size; // ensure it's in [0..ring_size-1]
     
         self.hist_ring[idx as usize] = frame_hist;
     
-        // Increment and wrap for next time
+        // increment and wrap for next time
         self.hist_index += 1;
         self.hist_index %= ring_size;
     
@@ -298,27 +331,27 @@ impl App {
             self.stored_frames += 1;
         }
 
-        // Smooth
+        // smoooooooooth
         self.smooth_speed_hist.fill(0.0);
         for frame_idx in 0..self.stored_frames {
-            let arr = &self.hist_ring[frame_idx as usize];
+            let arr: &Vec<f32> = &self.hist_ring[frame_idx as usize];
             for (bin_idx, &val) in arr.iter().enumerate() {
                 self.smooth_speed_hist[bin_idx] += val;
             }
         }
         if self.stored_frames > 0 {
-            let denom = self.stored_frames as f32;
+            let denom: f32 = self.stored_frames as f32;
             for bin_idx in 0..self.actual_num_bins {
                 self.smooth_speed_hist[bin_idx] /= denom;
             }
         }
     }
 
-    /// Runs an O(n^2) collision detection/resolution on **single thread** for simplicity.
-    /// (Making this parallel safely is more complex, requiring locks or other careful steps.)
+    /// Runs an O(n^2) collision detection/resolution on **single thread** for simplicity
+    /// If I try to make this parallel I may cry
     fn handle_collisions(&mut self) {
-        let diameter = self.params.radius * 2.0;
-        let n = self.actual_num_particles;
+        let diameter: f32 = self.params.radius * 2.0;
+        let n: usize = self.actual_num_particles;
 
         for i in 0..n {
             for j in (i + 1)..n {
