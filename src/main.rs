@@ -1,20 +1,12 @@
 #![feature(portable_simd)]
 
-/// The `egui` re-export for building native GUIs with the eframe framework.
-use eframe::egui::{self, Color32};
-/// Additional 2D geometric tools from eframe, e.g. `Vec2`.
-use eframe::epaint::Vec2;
-/// The `egui_plot` crate for plotting data in an egui-based app.
-use egui_plot::{Line, Plot, PlotPoints};
 
-/// The `rand` crate for random number generation.
+use eframe::egui::{self, Color32};
+use eframe::epaint::Vec2;
+use egui_plot::{Line, Plot, PlotPoints};
 use rand::Rng;
 use std::f32::consts::PI;
-
-/// Portable SIMD for updating positions in small batches.
 use core::simd::f32x8;
-
-/// For multi-core parallelism:
 use rayon::prelude::*;
 
 // ===================================================================================
@@ -30,12 +22,12 @@ const DEFAULT_MAX_SPEED: f32 = 50_000.0;
 const DEFAULT_NUM_BINS: usize = 500;
 const DEFAULT_MEAN_SPEED: f32 = 10_000.0;
 const DEFAULT_ROLLING_FRAMES: u64 = 500;
+const DEFAULT_STARTING_DISTRIBUTION: StartingDistribution = StartingDistribution::ConstantDist;
 
 // ===================================================================================
 // Simulation Parameters
 // ===================================================================================
 
-/// Configuration parameters that can be adjusted by the user before starting the simulation.
 #[derive(Clone)]
 struct SimulationParams {
     num_particles: usize,
@@ -82,7 +74,7 @@ struct ParticleStorage {
     vy: Vec<f32>,
 
     /// Per-particle colour used when drawing in the UI.
-    colors: Vec<Color32>,
+    colours: Vec<Color32>,
 }
 
 impl ParticleStorage {
@@ -93,10 +85,82 @@ impl ParticleStorage {
             y: vec![0.0; n],
             vx: vec![0.0; n],
             vy: vec![0.0; n],
-            colors: vec![Color32::WHITE; n],
+            colours: vec![Color32::WHITE; n],
         }
     }
 }
+
+// ==================================================================================================
+// The distribution of the speeds the particles are given when the simulation is initialised
+// ==================================================================================================
+
+/// Stores the option selected in an enum
+enum StartingDistribution {
+    MaxwellBoltzmann,
+    ConstantDist,
+    LinearRandom,
+    Normal
+}
+
+trait Distribution {
+    fn sample(self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32);
+    fn new() -> Self;
+}
+
+
+struct StandardNormal {
+
+}
+
+impl Distribution for StandardNormal {
+    
+    fn new() -> Self {
+        Self {}
+    }
+
+    fn sample(self, rng: &mut impl Rng, _mean_speed: f32) -> (f32, f32) {
+        let u1: f32 = rng.random();
+        let u2: f32 = rng.random();
+        let r = (-2.0_f32 * u1.ln()).sqrt();
+        let theta = 2.0_f32 * PI * u2;
+        (r * theta.cos(), r * theta.sin())
+    }  
+}
+
+struct ConstantDist {
+
+}
+
+struct LinearRandom {
+
+}
+
+
+
+
+
+
+struct MaxwellBoltzmann {
+
+}
+
+impl Distribution for MaxwellBoltzmann {
+    
+    fn new() -> Self {
+        Self {}
+    }
+
+    fn sample(self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32) {
+        let sigma = mean_speed * PI.sqrt() / 2.0;
+        let normal_gen: StandardNormal = StandardNormal::new(); 
+        let (vx, vy) = normal_gen.sample(rng, mean_speed);
+        let velocities = (sigma * vx, sigma * vy);
+
+        velocities
+    }
+}
+
+
 
 // ===================================================================================
 // Main Application
@@ -104,13 +168,13 @@ impl ParticleStorage {
 
 /// The primary application state:
 /// - A configuration UI (sliders, etc.) used to set up parameters
-/// - The "running" flag indicating if the simulation is active
-/// - A "reset needed" or "new init" function that re-creates the `ParticleStorage`
-/// - The data for the ring-buffered histogram and the smoothed histogram
+/// - The running flag indicating if the simulation is active
+/// - A reset-needed or new-init function that recreates the ParticleStorage
+/// - The data for the ring-buffered/smoothed histogram
 ///
-/// We do partial parallel updates (positions) but keep collisions single-threaded
+/// We do partial parallel updates but keep collisions single-threaded
 /// for correctness and simplicity.
-struct MyApp {
+struct App {
     // -------------- Config / UI --------------
     params: SimulationParams, // user-chosen parameters
     running: bool,            // is the simulation running?
@@ -130,10 +194,10 @@ struct MyApp {
     actual_num_bins: usize,
 }
 
-impl MyApp {
-    /// Creates the initial `MyApp` with default config (not yet running).
+impl App {
+    /// Creates the initial `App` with default config (not yet running).
     fn new() -> Self {
-        // Initially, we haven't created the real ParticleStorage because the user
+        // Initially, ParticleStorage does not exist because the user
         // can adjust sliders, then press "Start" or "Reset" to actually init.
         Self {
             params: SimulationParams::default(),
@@ -151,9 +215,9 @@ impl MyApp {
         }
     }
 
-    /// Initialises (or re-initialises) the simulation using the current `params`.
+    /// initialises the simulation using the current params
     fn reset_simulation(&mut self) {
-        // Create new storage for the requested particle count
+        // create new storage for the requested particle count
         self.particles = ParticleStorage::with_capacity(self.params.num_particles);
 
         let mut rng = rand::rng();
@@ -169,15 +233,15 @@ impl MyApp {
             //rng.random_range(0..(self.params.mean_speed as i64 * 2)) as f32;
             //sample_maxwell_boltzmann_speed(&mut rng, self.params.mean_speed);
 
-            let angle: f32 = rng.random_range(0.0..(2.0 * PI));
-            self.particles.vx[i] = speed * angle.cos();
-            self.particles.vy[i] = speed * angle.sin();
+            //let angle: f32 = rng.random_range(0.0..(2.0 * PI));
+            self.particles.vx[i] //= speed * angle.cos();
+            self.particles.vy[i] //= speed * angle.sin();
 
             // random colour
             let r = rng.random_range(0..=255) as u8;
             let g = rng.random_range(0..=255) as u8;
             let b = rng.random_range(0..=255) as u8;
-            self.particles.colors[i] = Color32::from_rgb(r, g, b);
+            self.particles.colours[i] = Color32::from_rgb(r, g, b);
         }
 
         // Update derived data
@@ -340,7 +404,7 @@ impl MyApp {
             self.particles.y[i] += self.particles.vy[i] * dt;
         }
 
-        // boundaries (also done in parallel for demonstration):
+        
         self.particles
             .x
             .par_iter_mut()
@@ -371,7 +435,7 @@ impl MyApp {
     }
 }
 
-impl eframe::App for MyApp {
+impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // --------------------------
         // Sidebar with configuration
@@ -426,16 +490,16 @@ impl eframe::App for MyApp {
         }
 
         // ------------------------------------
-        // If we're running, do the simulation steps
+        // If running, do the simulation steps
         // ------------------------------------
         if self.running {
-            // 1) Parallel + SIMD position updates
+            // position updates
             self.update_positions_parallel();
 
-            // 2) O(n^2) collisions (single-thread for correctness)
+            // collisions
             self.handle_collisions();
 
-            // 3) Compute histogram, push + smooth
+            // 3) compute histogram, push + smooth
             self.compute_speed_hist();
             self.push_and_smooth();
         }
@@ -494,7 +558,7 @@ impl eframe::App for MyApp {
                 let py = self.particles.y[i] * scale;
                 let pos = rect.min + Vec2::new(px, py);
 
-                painter.circle_filled(pos, self.params.radius.min(5.0) * scale, self.particles.colors[i]);
+                painter.circle_filled(pos, self.params.radius.min(5.0) * scale, self.particles.colours[i]);
             }
         });
 
@@ -504,43 +568,29 @@ impl eframe::App for MyApp {
 }
 
 // ===================================================================================
-// Normal sampling for Maxwell–Boltzmann distribution in 3D (unused, but included)
+// Normal sampling for Maxwell–Boltzmann distribution in 3D
 // ===================================================================================
 
-fn sample_standard_normal(rng: &mut impl Rng) -> f32 {
-    let u1: f32 = rng.random();
-    let u2: f32 = rng.random();
-    let r = (-2.0_f32 * u1.ln()).sqrt();
-    let theta = 2.0_f32 * PI * u2;
-    r * theta.cos()
-}
 
-fn sample_maxwell_boltzmann_speed(rng: &mut impl Rng, mean_speed: f32) -> f32 {
-    let sigma = mean_speed * PI.sqrt() / 2.0;
-    let vx = sigma * sample_standard_normal(rng);
-    let vy = sigma * sample_standard_normal(rng);
-    let vz = sigma * sample_standard_normal(rng);
-    (vx * vx + vy * vy + vz * vz).sqrt()
-}
+
 
 // ===================================================================================
 // main
 // ===================================================================================
 
 fn main() -> eframe::Result<()> {
-    // For large N, consider drastically lower N or using a broad-phase approach.
     let native_options = eframe::NativeOptions {
         ..Default::default()
     };
 
     rayon::ThreadPoolBuilder::new()
-        .num_threads(num_cpus::get_physical()) // or however many threads you want
+        .num_threads(num_cpus::get_physical()) 
         .build_global()
         .unwrap();
 
     eframe::run_native(
         "Particle Simulation (Parallel+SIMD + Collisions)",
         native_options,
-        Box::new(|_cc| Ok(Box::new(MyApp::new()))),
+        Box::new(|_cc| Ok(Box::new(App::new()))),
     )
 }
