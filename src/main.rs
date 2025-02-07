@@ -1,13 +1,12 @@
 #![feature(portable_simd)]
 
-
+use core::simd::f32x8;
 use eframe::egui::{self, Color32};
 use eframe::epaint::Vec2;
 use egui_plot::{Line, Plot, PlotPoints};
 use rand::Rng;
-use std::f32::consts::PI;
-use core::simd::f32x8;
 use rayon::prelude::*;
+use std::f32::consts::PI;
 
 // ===================================================================================
 // Default Constants (used as initial slider defaults)
@@ -41,7 +40,7 @@ struct SimulationParams {
     num_bins: usize,
     mean_speed: f32,
     rolling_frames: u64,
-    distribution: StartingDistribution
+    distribution: StartingDistribution,
 }
 
 impl Default for SimulationParams {
@@ -56,7 +55,7 @@ impl Default for SimulationParams {
             num_bins: DEFAULT_NUM_BINS,
             mean_speed: DEFAULT_MEAN_SPEED,
             rolling_frames: DEFAULT_ROLLING_FRAMES,
-            distribution: DEFAULT_STARTING_DISTRIBUTION
+            distribution: DEFAULT_STARTING_DISTRIBUTION,
         }
     }
 }
@@ -104,7 +103,7 @@ enum StartingDistribution {
     MaxwellBoltzmann,
     ConstantDist,
     LinearRandom,
-    Normal
+    Normal,
 }
 
 trait Distribution {
@@ -130,7 +129,9 @@ impl StartingDistribution {
 impl Distribution for StartingDistribution {
     fn sample(&self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32) {
         match self {
-            StartingDistribution::MaxwellBoltzmann => MaxwellBoltzmann::new().sample(rng, mean_speed),
+            StartingDistribution::MaxwellBoltzmann => {
+                MaxwellBoltzmann::new().sample(rng, mean_speed)
+            }
             StartingDistribution::ConstantDist => ConstantDist::new().sample(rng, mean_speed),
             StartingDistribution::LinearRandom => LinearRandom::new().sample(rng, mean_speed),
             StartingDistribution::Normal => StandardNormal::new().sample(rng, mean_speed),
@@ -142,10 +143,11 @@ impl Distribution for StartingDistribution {
     }
 }
 
-
+// ==================================================================================================
+// Various distributions
+// ==================================================================================================
 struct StandardNormal {}
 impl Distribution for StandardNormal {
-    
     fn new() -> Self {
         Self {}
     }
@@ -156,12 +158,11 @@ impl Distribution for StandardNormal {
         let r: f32 = (-2.0_f32 * u1.ln()).sqrt() * mean_speed;
         let theta: f32 = 2.0_f32 * PI * u2;
         (r * theta.cos(), r * theta.sin())
-    }  
+    }
 }
 
 struct ConstantDist {}
 impl Distribution for ConstantDist {
-    
     fn new() -> Self {
         Self {}
     }
@@ -180,9 +181,9 @@ impl Distribution for ConstantDist {
     }
 }
 
+// I think this is probably technically normal the way that it's implemented cumulatively or such like
 struct LinearRandom {}
 impl Distribution for LinearRandom {
-    
     fn new() -> Self {
         Self {}
     }
@@ -195,24 +196,24 @@ impl Distribution for LinearRandom {
     }
 }
 
+// technically Raleigh but close enough
+// MB is usually assumed to be 3d - if we treated like that, we could start in 3d MB config but it would rapidly thermalise back to 2d variant
+// The KE clamp already introduces enough energy leakage problems
 struct MaxwellBoltzmann {}
 impl Distribution for MaxwellBoltzmann {
-    
     fn new() -> Self {
         Self {}
     }
 
     fn sample(&self, rng: &mut impl Rng, mean_speed: f32) -> (f32, f32) {
         let sigma: f32 = PI.sqrt() / 2.0; // the mean_speed multiplication already happens in the normal distribution sampler
-        let normal_gen: StandardNormal = StandardNormal::new(); 
+        let normal_gen: StandardNormal = StandardNormal::new();
         let (vx, vy) = normal_gen.sample(rng, mean_speed);
         let velocities: (f32, f32) = (sigma * vx, sigma * vy);
 
         velocities
     }
 }
-
-
 
 // ===================================================================================
 // Main Application
@@ -234,19 +235,18 @@ struct App {
 
     // -------------- Simulation Data --------------
     particles: ParticleStorage,
-    speed_hist: Vec<f32>,                   // raw histogram for current frame
-    hist_ring: Vec<Vec<f32>>,               // ring buffer of histograms
-    hist_index: u64,                      // next slot in ring buffer
-    stored_frames: u64,                   // how many frames stored so far
-    smooth_speed_hist: Vec<f32>,            // rolling average of histograms
+    speed_hist: Vec<f32>,        // raw histogram for current frame
+    hist_ring: Vec<Vec<f32>>,    // ring buffer of histograms
+    hist_index: u64,             // next slot in ring buffer
+    stored_frames: u64,          // how many frames stored so far
+    smooth_speed_hist: Vec<f32>, // rolling average of histograms
 
     // -------------- Derived Data --------------
     // the actual number of particles, bin count, etc. from the last init
     actual_num_particles: usize,
     actual_num_bins: usize,
+    target_ke: f32, // NEW: total kinetic energy at simulation start
 }
-
-
 
 impl App {
     /// Creates the initial `App` with default config (not yet running).
@@ -264,6 +264,35 @@ impl App {
             smooth_speed_hist: vec![],
             actual_num_particles: 0,
             actual_num_bins: 0,
+            target_ke: 0.0,
+        }
+    }
+
+    /// Enforces global kinetic energy conservation
+    /// This computes the current total kinetic energy and rescales all particle velocities
+    /// so that the system's energy matches the target energy established at simulation reset
+
+    // the problem is that somehwere there's an instability (read: in the collision logic)
+    // so without the clamp it just diverges
+    // the non-parallel collision logic worked fine with no problems like this
+    // but that was slow so here we are.
+
+    // what's interesting is that changing the wall collisions to have 'recoil' in effect helped a lot - connected to potential energy?
+    fn enforce_energy_conservation(&mut self) {
+        let n = self.actual_num_particles;
+        let mut current_ke = 0.0;
+        for i in 0..n {
+            current_ke += self.particles.vx[i].powi(2) + self.particles.vy[i].powi(2);
+        }
+        if current_ke > 0.0 {
+            let scale: f32 = (self.target_ke / current_ke).sqrt();
+            // only scale if the factor deviates significantly from 1.0
+            if scale < 0.95 || scale > 1.05 {
+                for i in 0..n {
+                    self.particles.vx[i] *= scale;
+                    self.particles.vy[i] *= scale;
+                }
+            }
         }
     }
 
@@ -275,13 +304,18 @@ impl App {
         let mut rng = rand::rng();
         for i in 0..self.params.num_particles {
             // random position
-            let x: f32 = rng.random_range(self.params.radius..(self.params.box_size_x - self.params.radius));
-            let y: f32 = rng.random_range(self.params.radius..(self.params.box_size_y - self.params.radius));
+            let x: f32 =
+                rng.random_range(self.params.radius..(self.params.box_size_x - self.params.radius));
+            let y: f32 =
+                rng.random_range(self.params.radius..(self.params.box_size_y - self.params.radius));
             self.particles.x[i] = x;
             self.particles.y[i] = y;
 
             // sets the velocity of a new particle according to the distribution selected
-            let (vx, vy) = self.params.distribution.sample(&mut rng, self.params.mean_speed);
+            let (vx, vy) = self
+                .params
+                .distribution
+                .sample(&mut rng, self.params.mean_speed);
             self.particles.vx[i] = vx;
             self.particles.vy[i] = vy;
 
@@ -303,6 +337,12 @@ impl App {
         self.stored_frames = 0;
         self.smooth_speed_hist = vec![0.0; self.actual_num_bins];
 
+        // compute total kinetic energy (assume mass = 1 for all particles)
+        self.target_ke = 0.0;
+        for i in 0..self.params.num_particles {
+            self.target_ke += self.particles.vx[i].powi(2) + self.particles.vy[i].powi(2);
+        }
+
         self.needs_reset = false;
     }
 
@@ -318,7 +358,9 @@ impl App {
 
         // gather speed data
         for i in 0..self.actual_num_particles {
-            let speed: f32 = self.particles.vx[i].hypot(self.particles.vy[i]).min(self.params.max_speed);
+            let speed: f32 = self.particles.vx[i]
+                .hypot(self.particles.vy[i])
+                .min(self.params.max_speed);
             let bin: usize = (speed / bin_size) as usize;
             let bin: usize = bin.min(self.actual_num_bins - 1);
             self.speed_hist[bin] += 1.0;
@@ -331,17 +373,17 @@ impl App {
         // copy current histogram
         let mut frame_hist: Vec<f32> = vec![0.0; self.actual_num_bins];
         frame_hist.copy_from_slice(&self.speed_hist);
-    
+
         // make sure hist_index is wrapped
         let ring_size: u64 = self.hist_ring.len() as u64;
         let idx: u64 = self.hist_index % ring_size; // ensure it's in [0..ring_size-1]
-    
+
         self.hist_ring[idx as usize] = frame_hist;
-    
+
         // increment and wrap for next time
         self.hist_index += 1;
         self.hist_index %= ring_size;
-    
+
         if self.stored_frames < ring_size {
             self.stored_frames += 1;
         }
@@ -366,112 +408,95 @@ impl App {
     /// Then, only need to check for collision inside the box
     /// Collision events are collected in parallel and resolved in a single-threaded pass to avoid data races
     /// Improved from old O(n^2) system
+    /// ensuring each pair is processed exactly once per frame
     fn handle_collisions(&mut self) {
         use rayon::prelude::*;
+        use std::collections::HashSet;
 
         let diameter: f32 = self.params.radius * 2.0;
         let n: usize = self.actual_num_particles;
 
-        // local struct to store collision info
         #[derive(Clone)]
         struct Collision {
-            i: usize,   // index of first particle
-            j: usize,   // index of second particle
-            // velocity deltas
+            i: usize,
+            j: usize,
             dvx_i: f32,
             dvy_i: f32,
             dvx_j: f32,
             dvy_j: f32,
-            // position corrections
             dx_i: f32,
             dy_i: f32,
             dx_j: f32,
             dy_j: f32,
         }
 
-        // grid cell - should be at least the diameter but can be changed
         let cell_size: f32 = diameter * COLLISION_BOX_COEFFICIENT;
-        // number of cells in x and y directions
         let nx: isize = (self.params.box_size_x / cell_size).ceil() as isize;
         let ny: isize = (self.params.box_size_y / cell_size).ceil() as isize;
 
-        // build a vector of buckets, each bucket will store particle indices
-        // we make it of length nx * ny (convert to usize safely)
         if nx <= 0 || ny <= 0 {
-            // if the box dimensions are too small can just skip broad phase
-            // fallback to single thread loop or do nothing
             return;
         }
-        let mut grid: Vec<Vec<usize>> = vec![Vec::new(); (nx * ny) as usize];
 
-        // function to map a particle at (px, py) -> grid index
-        // returns None if out of bounds
+        // build grid
+        let mut grid: Vec<Vec<usize>> = vec![Vec::new(); (nx * ny) as usize];
         let grid_index = |px: f32, py: f32| -> Option<usize> {
             let gx: isize = (px / cell_size).floor() as isize;
             let gy: isize = (py / cell_size).floor() as isize;
             if gx < 0 || gy < 0 || gx >= nx || gy >= ny {
-                return None;
+                None
+            } else {
+                Some((gy * nx + gx) as usize)
             }
-            let idx = gy * nx + gx;
-            Some(idx as usize)
         };
 
-        // assign particles to grid buckets (single-threaded for simplicity)
+        // assign each particle to one bucket
         for i in 0..n {
-            let px = self.particles.x[i];
-            let py = self.particles.y[i];
-            if let Some(idx) = grid_index(px, py) {
+            if let Some(idx) = grid_index(self.particles.x[i], self.particles.y[i]) {
                 grid[idx].push(i);
             }
         }
 
-        // detection in parallel: for each cell, check collisions in that cell + some number of neighbours
-        // collect all collisions in local buffers, then flatten
+        // PHASE A: parallel detection - pain
         let collisions: Vec<Collision> = (0..grid.len())
             .into_par_iter()
-            .flat_map(|cell_id: usize| {
-                let mut local_collisions: Vec<Collision> = Vec::new();
-
+            .flat_map(|cell_id| {
+                let mut local_collisions = Vec::new();
                 let cell_x: isize = cell_id as isize % nx;
                 let cell_y: isize = cell_id as isize / nx;
 
-                // we look in [cell_x-1, cell_x, cell_x+1] and [cell_y-1, cell_y, cell_y+1]
                 for cx_off in (cell_x - 1).max(0)..=(cell_x + 1).min(nx - 1) {
                     for cy_off in (cell_y - 1).max(0)..=(cell_y + 1).min(ny - 1) {
-                        let neighbour_id: usize = (cy_off * nx + cx_off) as usize;
-
-                        // to avoid checking pairs twice, skip if neighbour < cell
+                        let neighbour_id = (cy_off * nx + cx_off) as usize;
                         if neighbour_id < cell_id {
                             continue;
                         }
-
                         let particles_a: &Vec<usize> = &grid[cell_id];
                         let particles_b: &Vec<usize> = &grid[neighbour_id];
 
                         for (index_a, &i) in particles_a.iter().enumerate() {
-                            // if same cell, only check j > i in that cell
                             let start_b: usize = if neighbour_id == cell_id {
                                 index_a + 1
                             } else {
                                 0
                             };
                             for &j in &particles_b[start_b..] {
-
                                 let dx: f32 = self.particles.x[j] - self.particles.x[i];
                                 let dy: f32 = self.particles.y[j] - self.particles.y[i];
-                                let dist2 = dx * dx + dy * dy;
+                                let dist2: f32 = dx * dx + dy * dy;
                                 if dist2 < diameter * diameter {
-                                    let dist = dist2.sqrt();
+                                    let dist: f32 = dist2.sqrt();
                                     if dist == 0.0 {
-                                        // perfect overlap => skip - something very bad has happened - bosons anyone?
                                         continue;
                                     }
 
                                     let nx: f32 = dx / dist;
                                     let ny: f32 = dy / dist;
 
-                                    let v1n: f32 = self.particles.vx[i] * nx + self.particles.vy[i] * ny;
-                                    let v2n: f32 = self.particles.vx[j] * nx + self.particles.vy[j] * ny;
+                                    let v1n: f32 =
+                                        self.particles.vx[i] * nx + self.particles.vy[i] * ny;
+                                    let v2n: f32 =
+                                        self.particles.vx[j] * nx + self.particles.vy[j] * ny;
 
                                     // swap normal components
                                     let v1n_post: f32 = v2n;
@@ -482,7 +507,6 @@ impl App {
                                     let dvx_j: f32 = (v2n_post - v2n) * nx;
                                     let dvy_j: f32 = (v2n_post - v2n) * ny;
 
-                                    // push them apart
                                     let overlap: f32 = diameter - dist;
                                     let half_overlap: f32 = 0.5 * overlap;
                                     let dx_i: f32 = -nx * half_overlap;
@@ -511,8 +535,24 @@ impl App {
             })
             .collect();
 
-        // single-threaded resolution 
+        // PHASE B: deduplicate collisions - the aim here is to avoid multiple 'collisions'
+        // the issue is that if the time step is not small enough, each collsion can be registered only after
+        // it has passed through another particle - this kicks it in the direction of the path it's already on
+        // meaning that we end up increasing the energy of the system
+        // which leads to all sorts of diveregence errors
+        let mut seen_pairs = HashSet::with_capacity(collisions.len());
+        let mut final_collisions = Vec::with_capacity(collisions.len());
+
         for c in collisions {
+            let pair: (usize, usize) = if c.i < c.j { (c.i, c.j) } else { (c.j, c.i) };
+            if !seen_pairs.contains(&pair) {
+                seen_pairs.insert(pair);
+                final_collisions.push(c);
+            }
+        }
+
+        // PHASE C: resolve collisions - actually apply the new velocities
+        for c in final_collisions {
             self.particles.vx[c.i] += c.dvx_i;
             self.particles.vy[c.i] += c.dvy_i;
             self.particles.vx[c.j] += c.dvx_j;
@@ -527,7 +567,7 @@ impl App {
 
     /// Parallel + SIMD approach for updating positions
     fn update_positions_parallel(&mut self) {
-        // position update in parallel chunks of 8.
+        // position update in parallel chunks of 8
         let n: usize = self.actual_num_particles;
         let dt: f32 = self.params.dt;
 
@@ -539,10 +579,14 @@ impl App {
             .into_par_iter()
             .map(|chunk_index| {
                 let chunk_start: usize = chunk_index * 8;
-                let vx_simd: std::simd::Simd<f32, 8> = f32x8::from_slice(&self.particles.vx[chunk_start..]);
-                let vy_simd: std::simd::Simd<f32, 8> = f32x8::from_slice(&self.particles.vy[chunk_start..]);
-                let x_simd: std::simd::Simd<f32, 8> = f32x8::from_slice(&self.particles.x[chunk_start..]);
-                let y_simd: std::simd::Simd<f32, 8> = f32x8::from_slice(&self.particles.y[chunk_start..]);
+                let vx_simd: std::simd::Simd<f32, 8> =
+                    f32x8::from_slice(&self.particles.vx[chunk_start..]);
+                let vy_simd: std::simd::Simd<f32, 8> =
+                    f32x8::from_slice(&self.particles.vy[chunk_start..]);
+                let x_simd: std::simd::Simd<f32, 8> =
+                    f32x8::from_slice(&self.particles.x[chunk_start..]);
+                let y_simd: std::simd::Simd<f32, 8> =
+                    f32x8::from_slice(&self.particles.y[chunk_start..]);
 
                 let dt_simd: std::simd::Simd<f32, 8> = f32x8::splat(dt);
                 let x_new: std::simd::Simd<f32, 8> = x_simd + vx_simd * dt_simd;
@@ -574,16 +618,23 @@ impl App {
         }
 
         // unfortunately we still need to check if we have hit any walls - I suspect this might be slowing things down quite a lot
+        // to avoid instabilities, we treat the walls as though they're bouncy but elastically so - no losses of energy
+        // basically we just flip the sign and move it exactly as far back in as we need to
         self.particles
             .x
             .par_iter_mut()
             .zip(self.particles.vx.par_iter_mut())
             .for_each(|(x, vx)| {
                 if *x < self.params.radius {
-                    *x = self.params.radius;
+                    // compute penetration depth
+                    let penetration = self.params.radius - *x;
+                    // reflect the position based on the penetration depth
+                    *x = self.params.radius + penetration;
+                    // reverse the x-velocity (elastic reflection)
                     *vx = -*vx;
                 } else if *x > self.params.box_size_x - self.params.radius {
-                    *x = self.params.box_size_x - self.params.radius;
+                    let penetration = *x - (self.params.box_size_x - self.params.radius);
+                    *x = (self.params.box_size_x - self.params.radius) - penetration;
                     *vx = -*vx;
                 }
             });
@@ -594,10 +645,12 @@ impl App {
             .zip(self.particles.vy.par_iter_mut())
             .for_each(|(y, vy)| {
                 if *y < self.params.radius {
-                    *y = self.params.radius;
+                    let penetration = self.params.radius - *y;
+                    *y = self.params.radius + penetration;
                     *vy = -*vy;
                 } else if *y > self.params.box_size_y - self.params.radius {
-                    *y = self.params.box_size_y - self.params.radius;
+                    let penetration = *y - (self.params.box_size_y - self.params.radius);
+                    *y = (self.params.box_size_y - self.params.radius) - penetration;
                     *vy = -*vy;
                 }
             });
@@ -614,38 +667,72 @@ impl eframe::App for App {
 
             // sliders: only matter if we haven't started or we want to reset
             if !self.running {
-                ui.add(egui::Slider::new(&mut self.params.num_particles, 1..=50_000).text("Particles"));
-                ui.add(egui::Slider::new(&mut self.params.radius, 0.5..=10.0).text("Particle Radius"));
-                ui.add(egui::Slider::new(&mut self.params.box_size_x, 1.0..=10_000.0).text("Box Size X"));
-                ui.add(egui::Slider::new(&mut self.params.box_size_y, 1.0..=10_000.0).text("Box Size Y"));
-                ui.add(egui::Slider::new(&mut self.params.dt, 0.0001..=1.0).text("DT"));
-                ui.add(egui::Slider::new(&mut self.params.max_speed, 1.0..=100_000.0).text("Max Speed"));
+                ui.add(
+                    egui::Slider::new(&mut self.params.num_particles, 1..=100_000)
+                        .text("Particles"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.params.radius, 0.1..=10.0).text("Particle Radius"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.params.box_size_x, 1.0..=10_000.0)
+                        .text("Box Size X"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.params.box_size_y, 1.0..=10_000.0)
+                        .text("Box Size Y"),
+                );
+                ui.add(egui::Slider::new(&mut self.params.dt, 0.000001..=0.01).text("DT"));
+                ui.add(
+                    egui::Slider::new(&mut self.params.max_speed, 1.0..=1_000_000.0)
+                        .text("Max Speed"),
+                );
                 ui.add(egui::Slider::new(&mut self.params.num_bins, 1..=1000).text("Num Bins"));
-                ui.add(egui::Slider::new(&mut self.params.mean_speed, 0.0..=50_000.0).text("Mean Speed"));
-                ui.add(egui::Slider::new(&mut self.params.rolling_frames, 1..=100_000).text("Rolling Frames"));
+                ui.add(
+                    egui::Slider::new(&mut self.params.mean_speed, 0.0..=100_000.0)
+                        .text("Mean Speed"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.params.rolling_frames, 1..=100_000)
+                        .text("Rolling Frames"),
+                );
                 egui::ComboBox::from_label("Starting Distribution") // why do dropdowns need so much configuring argg
-                .selected_text(self.params.distribution.as_str())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.params.distribution, StartingDistribution::MaxwellBoltzmann, "Maxwell-Boltzmann");
-                    ui.selectable_value(&mut self.params.distribution, StartingDistribution::ConstantDist, "Constant");
-                    ui.selectable_value(&mut self.params.distribution, StartingDistribution::LinearRandom, "Linear Random");
-                    ui.selectable_value(&mut self.params.distribution, StartingDistribution::Normal, "Normal");
-                });
-            
+                    .selected_text(self.params.distribution.as_str())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.params.distribution,
+                            StartingDistribution::MaxwellBoltzmann,
+                            "Maxwell-Boltzmann",
+                        );
+                        ui.selectable_value(
+                            &mut self.params.distribution,
+                            StartingDistribution::ConstantDist,
+                            "Constant",
+                        );
+                        ui.selectable_value(
+                            &mut self.params.distribution,
+                            StartingDistribution::LinearRandom,
+                            "Linear Random",
+                        );
+                        ui.selectable_value(
+                            &mut self.params.distribution,
+                            StartingDistribution::Normal,
+                            "Normal",
+                        );
+                    });
             } else {
                 ui.label("Parameters locked while running. Stop to change.");
             }
 
             ui.separator();
 
-            // Start / Stop
             if self.running {
                 if ui.button("Stop").clicked() {
                     self.running = false;
                 }
             } else {
                 if ui.button("Start").clicked() {
-                    // If we haven't initialised or user changed sliders => reset
+                    // if we haven't initialised or user changed sliders => reset
                     if self.needs_reset {
                         self.reset_simulation();
                     }
@@ -653,16 +740,16 @@ impl eframe::App for App {
                 }
             }
 
-            // Reset
+            // reset
             if ui.button("Reset").clicked() {
-                // Force a brand new system with current sliders
+                // force a brand new system with current sliders
                 self.reset_simulation();
-                // By default, remain "stopped"
+                // by default, remain "stopped"
                 self.running = false;
             }
         });
 
-        // If a reset was triggered but not performed yet, do it now
+        // if a reset was triggered but not performed yet, do it now
         if self.needs_reset {
             self.reset_simulation();
         }
@@ -676,6 +763,7 @@ impl eframe::App for App {
 
             // collisions
             self.handle_collisions();
+            self.enforce_energy_conservation();
 
             // 3) compute histogram, push + smooth
             self.compute_speed_hist();
@@ -725,7 +813,7 @@ impl eframe::App for App {
             let rect = ui.max_rect();
             let (width, height) = (rect.width(), rect.height());
 
-            // Scale from simulation box to the drawing area:
+            // scale from simulation box to the drawing area:
             let scale_x = width / self.params.box_size_x;
             let scale_y = height / self.params.box_size_y;
             let scale = scale_x.min(scale_y);
@@ -736,21 +824,18 @@ impl eframe::App for App {
                 let py = self.particles.y[i] * scale;
                 let pos = rect.min + Vec2::new(px, py);
 
-                painter.circle_filled(pos, self.params.radius.min(5.0) * scale, self.particles.colours[i]);
+                painter.circle_filled(
+                    pos,
+                    self.params.radius.min(5.0) * scale,
+                    self.particles.colours[i],
+                );
             }
         });
 
-        // Request another frame to keep animating (or remain static if stopped).
+        // request another frame to keep animating (or remain static if stopped).
         ctx.request_repaint();
     }
 }
-
-// ===================================================================================
-// Normal sampling for Maxwell–Boltzmann distribution in 3D
-// ===================================================================================
-
-
-
 
 // ===================================================================================
 // main
@@ -762,7 +847,7 @@ fn main() -> eframe::Result<()> {
     };
 
     rayon::ThreadPoolBuilder::new()
-        .num_threads(num_cpus::get_physical()) 
+        .num_threads(num_cpus::get_physical())
         .build_global()
         .unwrap();
 
