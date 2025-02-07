@@ -774,9 +774,9 @@ impl eframe::App for App {
         // UI layout for top, right, central
         // ------------------------------------
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.heading("2D Gas Simulation (Collisions, Parallel+SIMD)");
-            ui.label(format!("Particle count: {}", self.actual_num_particles));
-            ui.label("Note: collision is O(n^2) => can be very slow for large N.");
+            ui.heading("2D Gas Simulation");
+            ui.label(format!("Particle count: {}\nSystem kinetic energy (arbitrary units): {}", self.actual_num_particles, self.target_ke));
+            ui.label("For odd behaviours, set the particle radius high, decrease the box size, and set the time step to low");
         });
 
         egui::SidePanel::right("right_panel")
@@ -852,7 +852,7 @@ fn main() -> eframe::Result<()> {
         .unwrap();
 
     eframe::run_native(
-        "Particle Simulation (Parallel+SIMD + Collisions)",
+        "Particle Simulation",
         native_options,
         Box::new(|_cc| Ok(Box::new(App::new()))),
     )
