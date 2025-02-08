@@ -23,7 +23,7 @@ const DEFAULT_MEAN_SPEED: f32 = 10_000.0;
 const DEFAULT_ROLLING_FRAMES: u64 = 500;
 const DEFAULT_STARTING_DISTRIBUTION: StartingDistribution = StartingDistribution::ConstantDist;
 
-const COLLISION_BOX_COEFFICIENT: f32 = 0.5; // the size (in diameters) of the boxes used to parallelise the collision checking
+const COLLISION_BOX_COEFFICIENT: f32 = 1.0; // the size (in diameters) of the boxes used to parallelise the collision checking
 
 // ===================================================================================
 // Simulation Parameters
@@ -81,7 +81,7 @@ struct ParticleStorage {
 }
 
 impl ParticleStorage {
-    /// Constructs a new `ParticleStorage` with capacity for `n` particles.
+    /// Constructs a new ParticleStorage with capacity n
     fn with_capacity(n: usize) -> Self {
         Self {
             x: vec![0.0; n],
@@ -245,7 +245,7 @@ struct App {
     // the actual number of particles, bin count, etc. from the last init
     actual_num_particles: usize,
     actual_num_bins: usize,
-    target_ke: f32, // NEW: total kinetic energy at simulation start
+    target_ke: f32, // total kinetic energy at simulation start
 }
 
 impl App {
@@ -287,7 +287,7 @@ impl App {
         if current_ke > 0.0 {
             let scale: f32 = (self.target_ke / current_ke).sqrt();
             // only scale if the factor deviates significantly from 1.0
-            if scale < 0.95 || scale > 1.05 {
+            if scale < 0.99999 || scale > 1.00001 {
                 for i in 0..n {
                     self.particles.vx[i] *= scale;
                     self.particles.vy[i] *= scale;
@@ -540,8 +540,8 @@ impl App {
         // it has passed through another particle - this kicks it in the direction of the path it's already on
         // meaning that we end up increasing the energy of the system
         // which leads to all sorts of diveregence errors
-        let mut seen_pairs = HashSet::with_capacity(collisions.len());
-        let mut final_collisions = Vec::with_capacity(collisions.len());
+        let mut seen_pairs: HashSet<(usize, usize)> = HashSet::with_capacity(collisions.len());
+        let mut final_collisions: Vec<Collision> = Vec::with_capacity(collisions.len());
 
         for c in collisions {
             let pair: (usize, usize) = if c.i < c.j { (c.i, c.j) } else { (c.j, c.i) };
@@ -565,47 +565,39 @@ impl App {
         }
     }
 
-    /// Parallel + SIMD approach for updating positions
-    fn update_positions_parallel(&mut self) {
-        // position update in parallel chunks of 8
+    /// Computes new positions for all particles in parallel and returns two vectors
+    /// one for the new x positions and one for the new y positions
+    fn compute_new_positions(&self) -> (Vec<f32>, Vec<f32>) {
         let n: usize = self.actual_num_particles;
         let dt: f32 = self.params.dt;
+        let mut new_x: Vec<f32> = vec![0.0; n];
+        let mut new_y: Vec<f32> = vec![0.0; n];
 
-        // number of chunks
+        // process in chunks of 8
         let chunked_len: usize = n / 8;
-
-        // update the chunks in parallel
-        let new_positions: Vec<(f32x8, f32x8)> = (0..chunked_len)
+        let chunk_results: Vec<(usize, [f32; 8], [f32; 8])> = (0..chunked_len)
             .into_par_iter()
             .map(|chunk_index| {
                 let chunk_start: usize = chunk_index * 8;
-                let vx_simd: std::simd::Simd<f32, 8> =
-                    f32x8::from_slice(&self.particles.vx[chunk_start..]);
-                let vy_simd: std::simd::Simd<f32, 8> =
-                    f32x8::from_slice(&self.particles.vy[chunk_start..]);
-                let x_simd: std::simd::Simd<f32, 8> =
-                    f32x8::from_slice(&self.particles.x[chunk_start..]);
-                let y_simd: std::simd::Simd<f32, 8> =
-                    f32x8::from_slice(&self.particles.y[chunk_start..]);
 
+                let vx_simd: std::simd::Simd<f32, 8> = f32x8::from_slice(&self.particles.vx[chunk_start..chunk_start + 8]);
+                let vy_simd: std::simd::Simd<f32, 8> = f32x8::from_slice(&self.particles.vy[chunk_start..chunk_start + 8]);
+                let x_simd: std::simd::Simd<f32, 8> = f32x8::from_slice(&self.particles.x[chunk_start..chunk_start + 8]);
+                let y_simd: std::simd::Simd<f32, 8> = f32x8::from_slice(&self.particles.y[chunk_start..chunk_start + 8]);
                 let dt_simd: std::simd::Simd<f32, 8> = f32x8::splat(dt);
+                // compute new positions
                 let x_new: std::simd::Simd<f32, 8> = x_simd + vx_simd * dt_simd;
                 let y_new: std::simd::Simd<f32, 8> = y_simd + vy_simd * dt_simd;
-
-                (x_new, y_new)
+                (chunk_start, x_new.as_array().clone(), y_new.as_array().clone())
             })
             .collect();
 
-        for (chunk_index, (x_new, y_new)) in new_positions.into_iter().enumerate() {
-            let chunk_start = chunk_index * 8;
-            let x_slice: &mut [f32] = &mut self.particles.x[chunk_start..chunk_start + 8];
-            let y_slice: &mut [f32] = &mut self.particles.y[chunk_start..chunk_start + 8];
-            x_new.as_array().iter().enumerate().for_each(|(i, &val)| {
-                x_slice[i] = val;
-            });
-            y_new.as_array().iter().enumerate().for_each(|(i, &val)| {
-                y_slice[i] = val;
-            });
+        // write into the temporary vectors
+        for (chunk_start, x_chunk, y_chunk) in chunk_results {
+            for i in 0..8 {
+                new_x[chunk_start + i] = x_chunk[i];
+                new_y[chunk_start + i] = y_chunk[i];
+            }
         }
 
         // leftover - there's always someone....
@@ -613,24 +605,37 @@ impl App {
         // but UI design is hard....
         let leftover_start: usize = chunked_len * 8;
         for i in leftover_start..n {
-            self.particles.x[i] += self.particles.vx[i] * dt;
-            self.particles.y[i] += self.particles.vy[i] * dt;
+            new_x[i] = self.particles.x[i] + self.particles.vx[i] * dt;
+            new_y[i] = self.particles.y[i] + self.particles.vy[i] * dt;
         }
 
-        // unfortunately we still need to check if we have hit any walls - I suspect this might be slowing things down quite a lot
-        // to avoid instabilities, we treat the walls as though they're bouncy but elastically so - no losses of energy
-        // basically we just flip the sign and move it exactly as far back in as we need to
+        (new_x, new_y)
+    }
+
+    /// All position updates are calculated in parallel but held separately, then once done all are pushed together before the frame is sent
+    fn update_positions_parallel(&mut self) {
+        let (computed_x, computed_y) = self.compute_new_positions();
+
+        // update
+        self.particles.x = computed_x;
+        self.particles.y = computed_y;
+
+        // remove any from walls...
+        self.handle_wall_collisions();
+    }
+
+    // unfortunately we still need to check if we have hit any walls - I suspect this might be slowing things down quite a lot
+    // to avoid instabilities, we treat the walls as though they're bouncy but elastically so - no losses of energy
+    // basically we just flip the sign and move it exactly as far back in as we need to
+    fn handle_wall_collisions(&mut self) {
         self.particles
             .x
             .par_iter_mut()
             .zip(self.particles.vx.par_iter_mut())
             .for_each(|(x, vx)| {
                 if *x < self.params.radius {
-                    // compute penetration depth
                     let penetration = self.params.radius - *x;
-                    // reflect the position based on the penetration depth
                     *x = self.params.radius + penetration;
-                    // reverse the x-velocity (elastic reflection)
                     *vx = -*vx;
                 } else if *x > self.params.box_size_x - self.params.radius {
                     let penetration = *x - (self.params.box_size_x - self.params.radius);
@@ -655,6 +660,7 @@ impl App {
                 }
             });
     }
+
 }
 
 impl eframe::App for App {
@@ -765,7 +771,7 @@ impl eframe::App for App {
             self.handle_collisions();
             self.enforce_energy_conservation();
 
-            // 3) compute histogram, push + smooth
+            // compute histogram, push + smooth
             self.compute_speed_hist();
             self.push_and_smooth();
         }
