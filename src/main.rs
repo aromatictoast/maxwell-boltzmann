@@ -301,7 +301,7 @@ impl App {
         // create new storage for the requested particle count
         self.particles = ParticleStorage::with_capacity(self.params.num_particles);
 
-        let mut rng = rand::rng();
+        let mut rng: rand::prelude::ThreadRng = rand::rng();
         for i in 0..self.params.num_particles {
             // random position
             let x: f32 =
@@ -634,11 +634,11 @@ impl App {
             .zip(self.particles.vx.par_iter_mut())
             .for_each(|(x, vx)| {
                 if *x < self.params.radius {
-                    let penetration = self.params.radius - *x;
+                    let penetration: f32 = self.params.radius - *x;
                     *x = self.params.radius + penetration;
                     *vx = -*vx;
                 } else if *x > self.params.box_size_x - self.params.radius {
-                    let penetration = *x - (self.params.box_size_x - self.params.radius);
+                    let penetration: f32 = *x - (self.params.box_size_x - self.params.radius);
                     *x = (self.params.box_size_x - self.params.radius) - penetration;
                     *vx = -*vx;
                 }
@@ -650,11 +650,11 @@ impl App {
             .zip(self.particles.vy.par_iter_mut())
             .for_each(|(y, vy)| {
                 if *y < self.params.radius {
-                    let penetration = self.params.radius - *y;
+                    let penetration: f32 = self.params.radius - *y;
                     *y = self.params.radius + penetration;
                     *vy = -*vy;
                 } else if *y > self.params.box_size_y - self.params.radius {
-                    let penetration = *y - (self.params.box_size_y - self.params.radius);
+                    let penetration: f32 = *y - (self.params.box_size_y - self.params.radius);
                     *y = (self.params.box_size_y - self.params.radius) - penetration;
                     *vy = -*vy;
                 }
@@ -704,7 +704,7 @@ impl eframe::App for App {
                 );
                 egui::ComboBox::from_label("Starting Distribution") // why do dropdowns need so much configuring argg
                     .selected_text(self.params.distribution.as_str())
-                    .show_ui(ui, |ui| {
+                    .show_ui(ui, |ui: &mut egui::Ui| {
                         ui.selectable_value(
                             &mut self.params.distribution,
                             StartingDistribution::MaxwellBoltzmann,
@@ -789,15 +789,15 @@ impl eframe::App for App {
             .resizable(true)
             .show(ctx, |ui| {
                 ui.label("Speed distribution (rolling average)");
-                let plot = Plot::new("speed_histogram")
+                let plot: Plot<'_> = Plot::new("speed_histogram")
                     //.width(200.0)
                     //.height(400.0)
                     .allow_scroll(true)
                     .allow_drag(true);
 
-                plot.show(ui, |plot_ui| {
+                plot.show(ui, |plot_ui: &mut egui_plot::PlotUi| {
                     if !self.smooth_speed_hist.is_empty() {
-                        let bin_width = self.params.max_speed / self.actual_num_bins as f32;
+                        let bin_width: f32 = self.params.max_speed / self.actual_num_bins as f32;
                         let points: Vec<[f64; 2]> = self
                             .smooth_speed_hist
                             .iter()
@@ -808,27 +808,27 @@ impl eframe::App for App {
                             })
                             .collect();
 
-                        let line = Line::new(PlotPoints::from(points));
+                        let line: Line = Line::new(PlotPoints::from(points));
                         plot_ui.line(line);
                     }
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let painter = ui.painter();
-            let rect = ui.max_rect();
+        egui::CentralPanel::default().show(ctx, |ui: &mut egui::Ui| {
+            let painter: &egui::Painter = ui.painter();
+            let rect: egui::Rect = ui.max_rect();
             let (width, height) = (rect.width(), rect.height());
 
             // scale from simulation box to the drawing area:
-            let scale_x = width / self.params.box_size_x;
-            let scale_y = height / self.params.box_size_y;
-            let scale = scale_x.min(scale_y);
+            let scale_x: f32 = width / self.params.box_size_x;
+            let scale_y: f32 = height / self.params.box_size_y;
+            let scale: f32 = scale_x.min(scale_y);
 
             // Draw each particle as a small circle:
             for i in 0..self.actual_num_particles {
-                let px = self.particles.x[i] * scale;
-                let py = self.particles.y[i] * scale;
-                let pos = rect.min + Vec2::new(px, py);
+                let px: f32 = self.particles.x[i] * scale;
+                let py: f32 = self.particles.y[i] * scale;
+                let pos: egui::Pos2 = rect.min + Vec2::new(px, py);
 
                 painter.circle_filled(
                     pos,
@@ -860,6 +860,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Particle Simulation",
         native_options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(|_cc: &eframe::CreationContext<'_>| Ok(Box::new(App::new()))),
     )
 }
