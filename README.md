@@ -22,7 +22,7 @@ A 2D gas simulation written in Rust using parallelism (via Rayon) and SIMD (with
 - **Odd Behaviors:**
   The simulation exhibits some decidedly unusual behaviours in extreme limits - I suspect that all/almost all of these arise as a result of errors in the simulation logic, though it is certainly interesting to see bulk wave behaviour.
 
-Reciprocal distribution effect:
+Reciprocal(?) distribution effect:
 ![alt text](https://github.com/aromatictoast/maxwell-boltzmann/blob/main/images/Reciprocal_Distribution.png?raw=true)
 
 Intermediate hybrid distribution:
