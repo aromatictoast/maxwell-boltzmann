@@ -4,7 +4,7 @@ A 2D gas simulation written in Rust using parallelism (via Rayon) and SIMD (with
 
 ## Features
 
-- **Parallel & SIMD Updates:**  
+- **Parallelised & SIMD Updates:**  
   Efficient position updates and collision detection using Rayon and SIMD
 
 - **Collision Resolution:**  
