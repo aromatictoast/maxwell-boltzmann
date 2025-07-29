@@ -23,7 +23,7 @@ const DEFAULT_MEAN_SPEED: f32 = 10_000.0;
 const DEFAULT_ROLLING_FRAMES: u64 = 500;
 const DEFAULT_STARTING_DISTRIBUTION: StartingDistribution = StartingDistribution::ConstantDist;
 
-const COLLISION_BOX_COEFFICIENT: f32 = 1.0; // the size (in diameters) of the boxes used to parallelise the collision checking
+const COLLISION_BOX_COEFFICIENT: f32 = 0.5; // the size (in diameters) of the boxes used to parallelise the collision checking
 
 // ===================================================================================
 // Simulation Parameters
@@ -467,12 +467,20 @@ impl App {
 
                 for cx_off in (cell_x - 1).max(0)..=(cell_x + 1).min(nx - 1) {
                     for cy_off in (cell_y - 1).max(0)..=(cell_y + 1).min(ny - 1) {
-                        let neighbour_id = (cy_off * nx + cx_off) as usize;
+                        let neighbour_id: usize = (cy_off * nx + cx_off) as usize;
                         if neighbour_id < cell_id {
                             continue;
                         }
                         let particles_a: &Vec<usize> = &grid[cell_id];
                         let particles_b: &Vec<usize> = &grid[neighbour_id];
+                        
+                        //skip empty cells
+                        if particles_a.len() == 0 {
+                            continue;
+                        }
+                        else if particles_b.len() == 0 {
+                            continue;
+                        }
 
                         for (index_a, &i) in particles_a.iter().enumerate() {
                             let start_b: usize = if neighbour_id == cell_id {
