@@ -66,7 +66,6 @@ impl Default for SimulationParams {
 
 /// Stores the particle data in a **Structure of Arrays** (SoA) layout, which
 /// can be more convenient for batch updates or SIMD operations.
-
 struct ParticleStorage {
     /// Per-particle x-coordinate in the simulation space.
     x: Vec<f32>,
