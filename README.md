@@ -1,5 +1,6 @@
 # 2D Gas Simulation
 
+
 A 2D gas simulation written in Rust using parallelism (via Rayon) and SIMD (with the nightly `portable_simd` feature) for fast collision detection and resolution. The simulation supports several particle initialisation velocity distributions and includes a graphical UI built with eframe/egui. It allows for a delightful visualisation of the (2D) Maxwell-Boltzmann distribution (as well as some other, perhaps slightly less physically accurate phenomena. It's a fun little toy to play around with!
 
 ## Features
